@@ -299,7 +299,8 @@ nothing on aligned shapes.
 | `flash_fwd.cuh` + `attention.cu` | 2, 3 — forward, causal, d=128 |
 | `flash_bwd.cuh` + `bwd.cu` | 4 — backward, three-layer validation |
 | `fa_p100_ext.cu` + `fa_p100.py` | 5 — torch binding + `autograd.Function` |
-| `test_fa_p100.py`, `bench_train.py` | 5 — acceptance and training-step bench |
+| `test_fa_p100.py` | regression suite — 383 checks across both head dims, MHA/GQA/MQA, ragged N, four input regimes |
+| `bench_train.py` | full training step vs torch SDPA |
 | `multigpu.cu` | 6 — two-GPU data-parallel scaling |
 
 ## Running it
@@ -307,6 +308,9 @@ nothing on aligned shapes.
 ```bash
 cd ~/fa-p100
 make                                    # all standalone CUDA binaries
+
+# regression suite: 383 checks, exits non-zero on failure
+env PATH="$PWD/.venv/bin:$PATH" .venv/bin/python test_fa_p100.py
 numactl --cpunodebind=0 --membind=0 ./attention      # pin to card 0's NUMA node
 
 # from Python — .venv/bin MUST be on PATH or cpp_extension cannot find ninja
