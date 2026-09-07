@@ -11,7 +11,8 @@ __pycache__/
 # the torch venv (4.5 GB) and its build cache
 .venv/
 
-# run logs and one-off artifacts
+# run logs and one-off artifacts (BENCH.log is the measurement record, keep it)
 *.log
+!BENCH.log
 *.bak
 PHASE5-DONE

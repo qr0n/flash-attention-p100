@@ -1,0 +1,269 @@
+# FlashAttention P100 benchmark log — append-only.
+# Clocks: app 1189/715, boosts to 1328 MHz under load, no throttle (0x0), 140 W of 175 W cap.
+# Unless noted: card 0 (3b:00.0, NUMA node 0), CUDA 12.4.131, driver 580.173.02.
+#
+# date | phase | kernel | shape (B,H,N,d) or (M,N,K) | causal | time_ms | TFLOPS | %cuBLAS | max_rel_err | occupancy | notes
+2026-09-06 | 0 | p100_sweep fp16 | dependent half2 FMA chain | - | - | 15.79 | - | 0 (bitexact) | - | 83% of 19.04 peak; SASS 48xHFMA2/2xF2F; 1328MHz 140W no throttle
+2026-09-06 | 0 | p100_sweep fp32 | dependent f32 FMA chain | - | - | 8.68 | - | 0 (bitexact) | - | 91% of 9.52 peak; fp16/fp32 ratio 1.82x -> GATE PASS
+2026-09-06 | 0 | p100_sweep mem | 14.07 GB r+w stream | - | - | - | - | 0 (bitexact) | - | 498.8 GB/s achieved, 68% of 732 spec. Break-even C=d*B/2 -> 16.0 TF @d=64
+2026-09-06 | 1.1 | cuBLAS Hgemm (f16 acc) | 4096,4096,4096 | - | 9.258 | 14.84 | 100 | 4.9e-4 (f32acc layout chk) | - | 94% of the 15.79 fp16 ceiling. GATE for phase 1 = 7.42 TFLOPS
+2026-09-06 | 1.1 | cuBLAS Hgemm (f16 acc) | 8192,8192,8192 | - | 71.464 | 15.39 | - | - | - | 97% of ceiling; cuBLAS is near-perfect on big squares
+2026-09-06 | 1.1 | cuBLAS Hgemm (f16 acc) | 2048,2048,2048 | - | 1.408 | 12.21 | - | - | - | -
+2026-09-06 | 1.1 | cuBLAS Hgemm QK^T | 4096,4096,64 | - | 0.201 | 10.68 | 72 | - | - | skinny-K: 72% of square
+2026-09-06 | 1.1 | cuBLAS Hgemm QK^T | 4096,4096,128 | - | 0.315 | 13.63 | 92 | - | - | d=128 recovers most of the square rate
+2026-09-06 | 1.1 | cuBLAS Hgemm PV | 4096,64,4096 | - | 0.376 | 5.72 | 39 | - | - | skinny-N is the weak one. THIS is what fusion buys.
+2026-09-06 | 1.1 | cuBLAS Hgemm PV | 4096,128,4096 | - | 0.384 | 11.18 | 75 | - | - | -
+2026-09-06 | 1.1 | cuBLAS GemmEx (f32 acc) | 4096,4096,4096 | - | 17.273 | 7.96 | 54 | - | - | fp32 accumulate costs 1.87x on square, 2.35x at 8192. Confirms phase 2 fp16-acc strategy.
+2026-09-06 | 1.2 | mine v1 128x128x16 single-buf | 4096,4096,4096 | - | 10.637 | 12.92 | 85.3 | 1.37e-2 | 50% (60 reg, 8KB) | first working half2 SIMT GEMM. Gate was 50%.
+2026-09-06 | 1.3 | mine v2 128x128x16 prefetch | 4096,4096,4096 | - | 9.775 | 14.06 | 92.8 | 1.37e-2 | 37.5% (80 reg, 8KB) | +8.8% over v1 DESPITE losing occupancy. Register prefetch is the win, as predicted.
+2026-09-06 | 1.3 | mine v3 128x128x32 single-buf | 4096,4096,4096 | - | 10.205 | 13.47 | 88.9 | 1.37e-2 | 37.5% (80 reg, 16KB) | bigger K-step alone ~= half of what prefetch gives
+2026-09-06 | 1.3 | mine v4 128x128x32 prefetch | 4096,4096,4096 | - | 9.746 | 14.10 | 93.1 | 1.37e-2 | 25% (94 reg, 16KB) | BEST. 89% of the 15.79 hw ceiling. BK=32 adds only +0.3% over BK=16.
+#
+# --- Phase 2: fused forward, d=64, non-causal. BH=16, fp16 in/out. ---
+# "unfused" = cuBLAS HgemmStridedBatched QK^T -> softmax kernel -> cuBLAS PV.
+# Error columns are max_rel vs an fp64 CPU reference computed from the SAME
+# fp16 inputs, normalised by the RMS of the reference output.
+# regimes: 1=N(0,1)  2=inputs x10  3=near-uniform  4=near-one-hot
+#
+2026-09-06 | 2 | unfused cuBLAS+softmax | 16,-,4096,64 | no | 13.907 | 4.94 | - | r1 1.9e-2 r2 5.9e-1 r3 1.2e-2 r4 8.9e-2 | - | CONTROL. materialises a 537 MB score matrix.
+2026-09-06 | 2 | flash 128x32 drain64 | 16,-,4096,64 | no | 7.038 | 9.76 | 198 | r1 1.4e-2 r2 5.9e-1 r3 4.5e-3 r4 8.9e-2 | 154 reg 28KB | fastest. FAILS regimes 2+4 -- identically to cuBLAS, so not a kernel bug.
+2026-09-06 | 2 | flash 128x32 drain16 | 16,-,4096,64 | no | 7.228 | 9.51 | 192 | r1 7.8e-3 r2 1.7e-1 r3 4.4e-3 r4 2.3e-2 | 146 reg 28KB | fp32 SUM. passes 1,3,4 for -2.6%. Best throughput mode.
+2026-09-06 | 2 | flash 64x64  drain64 | 16,-,4096,64 | no | 7.517 | 9.14 | 185 | (same errs as 128x32 drain64) | 132 reg 24KB | -
+2026-09-06 | 2 | flash 64x64  drain16 | 16,-,4096,64 | no | 7.527 | 9.13 | 185 | r1 9.1e-3 r2 1.7e-1 r3 7.3e-3 r4 2.3e-2 | 146 reg 24KB | drain16 is FREE at N=4096 on this tile (-0.1%)
+2026-09-06 | 2 | flash 64x64  fp32mac | 16,-,4096,64 | no | 10.062 | 6.83 | 138 | r1 7.8e-3 r2 8.9e-4 r3 7.3e-3 r4 1.9e-3 | 153 reg 24KB | *** PASSES ALL FOUR REGIMES *** costs 28% vs drain64. GATE PASS.
+2026-09-06 | 2 | flash 128x32 fp32mac | 16,-,4096,64 | no | 10.066 | 6.83 | 138 | r1 6.0e-3 r2 8.1e-4 r3 4.4e-3 r4 1.5e-3 | 132 reg 28KB | same speed as 64x64 fp32mac
+2026-09-06 | 2 | flash 128x32 drain64 | 16,-,2048,64 | no | 2.122 | 8.10 | 171 | - | - | N=2048 gate shape
+2026-09-06 | 2 | flash 64x64  drain64 | 16,-,2048,64 | no | 1.865 | 9.21 | 195 | - | - | best at N=2048; 64x64 wins small, 128x32 wins large
+2026-09-06 | 2 | flash 64x64  fp32mac | 16,-,2048,64 | no | 2.638 | 6.51 | 138 | all four pass | - | GATE: correct on 4 regimes AND 1.38x unfused at N=2048. PASS.
+#
+# --- Phase 3: causal + d=128. BH=16. TFLOPS counts USEFUL work (causal = half).
+# NOTE: from here on Q is NOT pre-scaled in fp16; 1/sqrt(d) is applied to the
+# fp32 logit instead. At d=128 the old fp16 pre-scale cost 1e-1 of relative
+# error in regime 2 and survived even fp32 MACs.
+#
+2026-09-06 | 3 | unfused cuBLAS        | 16,-,4096,64  | no  | 14.038 | 4.90 | - | - | - | CONTROL
+2026-09-06 | 3 | unfused cuBLAS        | 16,-,4096,64  | YES | 12.972 | 2.65 | - | - | - | cuBLAS cannot skip the triangle; it computes all N^2 either way
+2026-09-06 | 3 | flash 128x32 T128 d16 | 16,-,4096,64  | no  |  7.337 | 9.37 | 191 | r2 1.7e-1 r4 2.3e-2 | 146 reg 28KB | best non-causal d=64
+2026-09-06 | 3 | flash 64x64  T128 d16 | 16,-,4096,64  | YES |  4.112 | 8.36 | 315 | r2 1.9e-1 r4 2.4e-2 | 24KB | *** 3.15x unfused. causal nearly halves the time (7.76 -> 4.11) ***
+2026-09-06 | 3 | flash 64x64  T128 f32 | 16,-,4096,64  | YES |  5.483 | 6.27 | 237 | ALL FOUR PASS | 24KB | full precision + causal, still 2.37x unfused
+2026-09-06 | 3 | unfused cuBLAS        | 16,-,4096,128 | no  | 16.885 | 8.14 | - | - | - | cuBLAS is 1.66x FASTER at d=128 than d=64 (healthy shapes)
+2026-09-06 | 3 | flash 64x32  T128 d16 | 16,-,4096,128 | no  | 16.898 | 8.13 | 100 | r2 2.1e-1 r4 3.1e-2 | 32KB | PARITY with cuBLAS. Fusion buys memory here, not speed.
+2026-09-06 | 3 | flash 64x32  T128 d64 | 16,-,4096,128 | no  | 16.262 | 8.45 | 104 | r4 1.5e-1 FAIL | 32KB | drain64 is 4% faster and fails regime 4. Not worth it.
+2026-09-06 | 3 | flash 64x64  T256 d16 | 16,-,4096,128 | no  | 17.081 | 8.05 |  99 | - | 48KB (1 blk/SM) | tile sweep: no win. 48KB smem = 1 block/SM.
+2026-09-06 | 3 | flash 64x16  T128 d16 | 16,-,4096,128 | no  | 20.656 | 6.65 |  82 | - | 24KB | plan suggested Bc=16 for d=128; it is 18% WORSE than Bc=32.
+2026-09-06 | 3 | flash 32x32  T128 d16 | 16,-,4096,128 | no  | 23.254 | 5.91 |  73 | - | 24KB | -
+2026-09-06 | 3 | flash 64x32  T256 d16 | 16,-,4096,128 | YES | 10.149 | 6.77 | 156 | r2 2.1e-1 r4 2.6e-2 | 32KB | causal rescues d=128: 1.56x unfused
+2026-09-06 | 3 | flash 64x32  T256 f32 | 16,-,4096,128 | no  | 28.369 | 4.84 |  60 | ALL FOUR PASS (r2 8.3e-4) | 32KB | scale fix took r2 from 9.6e-2 to 8.3e-4
+#
+# --- Phase 4: backward pass. BH=16, d=64. fp32 accumulate throughout.
+# Validation is three-layer: finite differences vs the analytic fp64 reference
+# (4.16e-10 -> formula confirmed), then kernel vs reference, then four regimes.
+# TFLOPS counts 10*BH*N^2*d (five matmuls), halved for causal.
+#
+2026-09-06 | 4 | bwd fp32 BR64 BC32 | 16,-,4096,64 | no  | 58.101 | 2.96 | - | dQ 1.6e-2 dK 1.7e-2 dV 1.2e-3 ALL 4 REGIMES PASS | 133 reg 32KB | bwd/fwd 7.37x vs a 2.5x flop ratio
+2026-09-06 | 4 | bwd fp32 BR64 BC64 | 16,-,4096,64 | no  | 54.401 | 3.16 | - | identical errors to BC32 | 48KB (1 blk/SM) | *** BEST. +6.8% from halving the Q/dO re-reads. ***
+2026-09-06 | 4 | bwd fp32 BR64 BC32 | 16,-,4096,64 | YES | 29.589 | 2.90 | - | ALL 4 REGIMES PASS | 32KB | causal halves it, as in the forward
+2026-09-06 | 4 | bwd fp32 BR64 BC64 | 16,-,2048,64 | no  | 14.240 | 3.02 | - | - | 48KB | +12% over BC32 at N=2048
+#
+# Five optimisation hypotheses, tested in order. Only the last one holds:
+#   1. dQ fp32 atomicAdd contention .......... 0.1-8%   (NO_ATOMIC diagnostic build)
+#   2. MAC rate: half2 on S/dP and dQ ........ +13%     AND fails regimes 2+4 badly
+#   3. dV/dK shared fragment count (1cx16k -> 2cx8k) .. +0.2%
+#   4. __half2float count (hoist out of the pairing loop) .. 0% (ptxas already CSE'd it)
+#   5. global traffic: BC 32 -> 64, halving Q/dO re-reads .. +6.8%  <-- the real one
+#
+# So the backward is GLOBAL-MEMORY-TRAFFIC bound, not compute, not atomics.
+# Recompute economics, closing the loop on the corrected break-even at the top
+# of PLAN.md: threshold 16.0 TFLOPS at d=64, backward achieves 3.16, so
+# recomputing S should cost ~5.1x what storing and reloading it would.
+# Measured: recompute 34.4 GFLOP / 3.16 TF = 10.9 ms vs 1.07 GB / 499 GB/s =
+# 2.15 ms to store+reload. Ratio 5.1x. The formula predicted it exactly.
+#
+# --- Phase 5: BLOCKED [SUPERSEDED 2026-09-06 -- see "PASSED" entry below] ---
+# The plan worried about the sm_60 arch list. The actual first blocker is the
+# interpreter: this box runs Python 3.14.4, and the oldest torch wheel offered
+# for 3.14 is 2.9.0. The plan's known-good sm_60 combination (torch 2.4.1 +
+# cu121, Aug 2024) has no 3.14 wheel at all -- `pip index versions torch
+# --index-url .../cu121` returns "No matching distribution found".
+# Reaching Phase 5 therefore needs a Python 3.11/3.12 alongside 3.14 (venv or
+# pyenv) BEFORE the arch-list question can even be asked. Not attempted:
+# it changes the environment of a box that is also the llama-swap LLM host.
+#
+# --- Phase 6: two-GPU data parallel. Both cards idle, numactl --interleave=all.
+2026-09-06 | 6 | flash fwd 64x64 drain16 | 16,-,4096,64 | no | 8.426 | 8.16 | - | - | - | card 0 alone (3b:00.0, NUMA 0)
+2026-09-06 | 6 | flash fwd 64x64 drain16 | 16,-,4096,64 | no | 8.477 | 8.11 | - | - | - | card 1 alone (af:00.0, NUMA 1, CPU2 riser) -- within 0.6% of card 0
+2026-09-06 | 6 | flash fwd, BOTH cards   | 2x16,-,4096,64 | no | 8.474 | 16.22 | - | - | - | *** 1.99x of ideal 2.00x. No PCIe/NUMA interference. ***
+
+# --- Phase 5: raw unattended test dump [curated summary follows below] ---
+# Python 3.12.13 (deadsnakes/resolute) in ./.venv; torch 2.4.1+cu121.
+# arch list: sm_50 sm_60 sm_70 sm_75 sm_80 sm_86 sm_90  -> sm_60 PRESENT, no source build needed.
+# RESULT: test completed. Full output below.
+# /home/iron/fa-p100/.venv/lib/python3.12/site-packages/torch/utils/cpp_extension.py:1965: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+# If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+#   warnings.warn(
+# torch 2.4.1+cu121
+# arch list: ['sm_50', 'sm_60', 'sm_70', 'sm_75', 'sm_80', 'sm_86', 'sm_90']
+# device: Tesla P100-PCIE-16GB, capability (6, 0)
+# 
+# === forward correctness (vs plain-torch fp32 reference) ===
+#                  shape  causal  fp16 tier  fp32 tier
+#           (1,4,256,64)   False   1.69e-02   9.66e-03
+#           (1,4,256,64)    True   9.13e-03   9.13e-03
+#           (2,8,512,64)   False   4.01e-02   2.34e-02
+#           (2,8,512,64)    True   3.01e-02   3.01e-02
+#         (1,16,1024,64)   False   2.24e-02   1.89e-02
+#         (1,16,1024,64)    True   2.41e-02   2.41e-02
+# 
+# === gradient correctness (vs autograd through the reference) ===
+#                  shape  causal         dQ         dK         dV
+#           (1,4,256,64)   False   4.85e-03   4.82e-03   2.39e-03
+#           (1,4,256,64)    True   9.70e-03   7.02e-03   9.18e-03
+#           (2,4,512,64)   False   6.73e-03   6.67e-03   6.69e-03
+#           (2,4,512,64)    True   1.40e-02   1.41e-02   1.20e-02
+# 
+# === speed vs torch scaled_dot_product_attention ===
+#                  shape  causal   sdpa ms  flash ms  speedup   peak MB
+#         (1,16,2048,64)   False     4.714     2.108    2.24x  44 -> 44
+#         (1,16,2048,64)    True     2.612     1.193    2.19x  44 -> 44
+#         (1,16,4096,64)   False    16.295     7.300    2.23x  61 -> 61
+#         (1,16,4096,64)    True     8.495     3.952    2.15x  61 -> 61
+# 
+# === training-step smoke test (fwd + bwd, causal) ===
+#   fwd+bwd 1.553 ms   grads finite: True
+#
+# --- Phase 5: torch binding. PASSED 2026-09-06. ---
+# Python 3.12.13 (deadsnakes ppa, resolute dist) in ./.venv; torch 2.4.1+cu121.
+# arch list: sm_50 sm_60 sm_70 sm_75 sm_80 sm_86 sm_90 -> sm_60 PRESENT.
+# NO SOURCE BUILD NEEDED. The plan said to expect one; it was wrong.
+# Real blocker was the interpreter: Ubuntu 26.04 ships Python 3.14 only and no
+# torch older than 2.9.0 exists for 3.14.
+#
+# Baseline here is torch F.scaled_dot_product_attention, NOT the hand-rolled
+# unfused cuBLAS path used in phases 2-3. Backend availability on sm_60:
+#   flash          UNAVAILABLE ("No available kernel")
+#   mem_efficient  works, peak 16.8 MB  <- what SDPA picks by default
+#   math           works, peak 297.9 MB (materialises the N^2 score matrix)
+#
+# *** CORRECTION to the phase 2/3 framing: torch ALREADY avoids the N^2 matrix
+# *** on Pascal via mem_efficient. The "never allocates 537 MB" advantage holds
+# *** only against a naive/math implementation, not against torch's default.
+# *** The real result is 2.2x FASTER THAN A COMPETENT BASELINE at equal memory.
+#
+2026-09-06 | 5 | flash vs torch SDPA | 1,16,2048,64 | no  | 2.108 | - | - | fwd 4.0e-2 (fp16 tier) 2.3e-2 (fp32 tier) | - | sdpa 4.714 ms -> 2.24x. peak mem 44 vs 44 MB (parity)
+2026-09-06 | 5 | flash vs torch SDPA | 1,16,2048,64 | YES | 1.193 | - | - | - | - | sdpa 2.612 ms -> 2.19x
+2026-09-06 | 5 | flash vs torch SDPA | 1,16,4096,64 | no  | 7.300 | - | - | - | - | sdpa 16.295 ms -> 2.23x
+2026-09-06 | 5 | flash vs torch SDPA | 1,16,4096,64 | YES | 3.952 | - | - | - | - | sdpa 8.495 ms -> 2.15x
+2026-09-06 | 5 | gradients vs autograd | 2,4,512,64 | no  | - | - | - | dQ 6.7e-3 dK 6.7e-3 dV 6.7e-3 | - | through autograd.Function, end to end
+2026-09-06 | 5 | gradients vs autograd | 2,4,512,64 | YES | - | - | - | dQ 1.4e-2 dK 1.4e-2 dV 1.2e-2 | - | -
+2026-09-06 | 5 | training step fwd+bwd | 1,8,1024,64 | YES | 1.553 | - | - | grads all finite | - | smoke test through autograd
+#
+# Build traps hit, both worth remembering:
+#   1. AT_CUDA_CHECK needs <ATen/cuda/Exceptions.h>; torch/extension.h does NOT pull it in.
+#   2. `pip install ninja` is NOT enough when invoking .venv/bin/python directly --
+#      cpp_extension shells out to the ninja BINARY, and .venv/bin is only on PATH
+#      if the venv is activated. `import ninja` succeeding proves nothing.
+#   3. nvcc 12.4 (system) against torch's bundled CUDA 12.1 headers: NO conflict.
+#
+# --- Phase 5b: FULL TRAINING STEP vs torch SDPA (bench_train.py), 2026-09-06 ---
+# Phase 5 only ever timed the forward. Training pays for both halves, and the
+# backward is this kernel's weak side, so the fwd-only 2.2x was not the number
+# that matters. Measured properly it is BETTER, not worse.
+#
+# Baseline: F.scaled_dot_product_attention, mem_efficient backend, fp16.
+# Peak MB is over a complete fwd+bwd step with grads materialised.
+#
+# shape        caus | fwd torch/mine  x   | bwd torch/mine   x   | STEP x | peak MB
+# 1,16,2048,64  no  |  4.809 / 2.005 2.40 | 43.270 / 14.081 3.07 | 2.99x | 46 -> 42
+# 1,16,2048,64  YES |  2.382 / 1.123 2.12 | 22.744 /  7.511 3.03 | 2.91x | 46 -> 42
+# 1,16,4096,64  no  | 15.840 / 7.249 2.18 |174.366 / 54.461 3.20 | 3.08x | 93 -> 84
+# 1,16,4096,64  YES |  8.473 / 3.971 2.13 | 88.804 / 27.770 3.20 | 3.06x | 93 -> 84
+#
+# THE BACKWARD IS THE BIGGER WIN (3.20x) NOT THE SMALLER ONE (2.18x fwd).
+# Phase 4 called the backward weak because it is 6.9x its own forward against a
+# 2.5x flop ratio -- true, but torch's mem_efficient backward is 9.0x ITS own
+# forward. Both are poor on Pascal; this one is less poor.
+#
+# Memory fix applied 2026-09-06 after the first run showed 118 MB vs torch's 93:
+# the binding was allocating fp32 dQ/dK/dV then casting to fp16, holding both.
+# dK/dV are written ONCE from registers, so `GOutT` now templates their storage
+# type and the binding writes fp16 directly. dQ stays fp32 -- it is built by
+# atomicAdd across blocks and has no choice. Result: 118 -> 84 MB, now 10%
+# BELOW torch. Standalone bwd correctness bit-identical; torch-side dK/dV
+# actually improved (6.7e-3 -> 3.4e-3 non-causal) by dropping a round trip.
+#
+# --- Usability pass, 2026-09-07: arbitrary N, GQA/MQA, d=128 in the binding ---
+#
+# ARBITRARY N. Padded rows/cols read as zero, then masked. A zeroed K column
+# gives S=0 and exp(0-m) is NOT zero, so the tail must be masked explicitly --
+# the zero fill alone silently corrupts the softmax. In the backward, Lse[row]
+# and Dv[row] were read unconditionally, out of bounds for a padded row; those
+# reads now route through a clamped index and dead lanes contribute exactly 0.
+# Verified: 14 lengths x causal/non-causal forward, 12 lengths x grads. 0 fails.
+#
+# COST, and the fix. Bounds checking as a runtime branch cost 7% on the backward
+# (3.06x -> 2.88x end to end). Made it a template parameter (BOUNDS) with the
+# launcher picking the aligned instantiation when N % BR == 0 && N % BC == 0.
+# Full speed restored: 3.11x / 2.99x. Correctness for any N, no cost when aligned.
+#
+# GQA/MQA. Forward remaps the K/V head per Q head. The backward could not do
+# that -- dK/dV must ACCUMULATE over the query heads sharing a K/V head -- so
+# blockIdx.y now indexes the K/V head and the group loop moved INSIDE, which
+# keeps the accumulation in registers instead of needing atomics on dK/dV.
+# Verified MHA/GQA/MQA (Hq/Hkv = 8/8, 8/4, 8/2, 8/1, 12/4, 16/2): 0 fails.
+#
+# d=128 IN THE BINDING -- and it overturns the Phase 3 conclusion.
+# Tile shapes differ per head dim because smem binds at different points:
+#   d=64  fwd 64x64 (24 KB)  bwd 64x64 (48 KB, at the cap)
+#   d=128 fwd 64x32 (32 KB)  bwd 32x32 (36 KB; 64x32 would need 56 KB)
+#
+2026-09-07 | u | flash vs torch SDPA step | 1,8,2048,128 | no  | 24.837 | - | - | - | - | torch 86.779 ms -> 3.49x
+2026-09-07 | u | flash vs torch SDPA step | 1,8,2048,128 | YES | 12.043 | - | - | - | - | torch 45.339 ms -> 3.76x
+2026-09-07 | u | flash vs torch SDPA step | 1,8,4096,128 | no  | 93.198 | - | - | - | - | torch 344.995 ms -> 3.70x
+2026-09-07 | u | flash vs torch SDPA step | 1,8,4096,128 | YES | 45.485 | - | - | - | - | torch 176.317 ms -> 3.88x
+#
+# *** CORRECTION to Phase 3. "d=128 is at parity, fusion buys memory not speed"
+# *** was measured FORWARD-ONLY against the hand-rolled unfused cuBLAS path.
+# *** Against torch SDPA on a FULL TRAINING STEP, d=128 is the BEST case:
+# *** 3.49-3.88x, beating d=64's 2.99-3.11x. Two measurement errors compounded:
+# *** the wrong half of the computation, and a baseline nobody runs.
+2026-09-07 | u | flash vs torch SDPA step | 1,16,4096,64 | no  | 61.148 | - | - | 0/30 configs fail | - | torch 190.138 -> 3.11x (d=64 for comparison)
+2026-09-07 | u | flash vs torch SDPA step | 1,16,4096,64 | YES | 32.514 | - | - | - | - | torch 97.312 -> 2.99x
+#
+# --- Backward optimisation round 2, 2026-09-07: read the SASS instead of guessing ---
+#
+# Four hypotheses had already died (atomics, half2-in-outer-products, tile
+# reshape, conversion hoisting). Rather than invent a fifth, counted the actual
+# instruction mix with `cuobjdump -sass`:
+#
+#   6473 instructions in bwd_kernel<64,64,64,128>
+#     FFMA   1856  28.7%   <- the actual math
+#     HADD2   864  13.3%   <- __half2float. Pascal compiles it to
+#                             HADD2.F32 Rd, Rs.H0_H0, -RZ.H0_H0
+#     XMAD/MOV/IADD/LEA/SHR/ISETP  1772  27.4%  <- address arithmetic
+#   math 49.9% | address 27.4%
+#
+# So it is ISSUE bound -- 3.5 instructions per useful FMA -- and the
+# conversions are a seventh of the whole kernel. That also retires the
+# "global-traffic bound" reading from the first round: BC 32->64 helped, but
+# the instruction stream is the real ceiling.
+#
+# THE FIX. The earlier half2 experiment had applied __hfma2 to the OUTER
+# products (S/dP and dQ) -- exactly where dS = P*(dP - D) cancellation lives --
+# and got +13% with regimes 2/4 blown out to ~1e0. The dV/dK CONTRACTION is the
+# opposite case: P is in [0,1] against unit-variance dO, the fp16 run is only 8
+# terms before draining to fp32, and it is where the conversions concentrate.
+# Applying half2 THERE ONLY (H2_DVDK):
+#
+2026-09-07 | 4b | bwd fp32 BC64      | 16,-,4096,64 | no  | 54.254 | 3.17 | - | ALL 4 PASS | - | baseline
+2026-09-07 | 4b | bwd H2_DVDK        | 16,-,4096,64 | no  | 50.326 | 3.41 | - | ALL 4 PASS | - | +7.8%, accuracy intact
+2026-09-07 | 4b | bwd H2_DVDK causal | 16,-,4096,64 | YES | 26.071 | 3.29 | - | ALL 4 PASS | - | +13.2% over fp32 causal
+#
+# Same instruction, opposite verdict, depending only on WHICH matmul it lands
+# in. That is the transferable lesson, not the +13%.
+#
+# --- FINAL: full training step vs torch SDPA, everything enabled ---
+2026-09-07 | F | flash step | 1,16,2048,64  | no  | 15.342 | - | - | 0/24 configs fail | 42 MB | torch 48.082 -> 3.13x
+2026-09-07 | F | flash step | 1,16,2048,64  | YES |  8.068 | - | - | - | 42 MB | torch 25.122 -> 3.11x
+2026-09-07 | F | flash step | 1,16,4096,64  | no  | 57.756 | - | - | - | 84 MB | torch 190.203 -> 3.29x  (bwd alone 3.45x)
+2026-09-07 | F | flash step | 1,16,4096,64  | YES | 29.596 | - | - | - | 84 MB | torch  97.350 -> 3.29x  (bwd alone 3.46x)
+2026-09-07 | F | flash step | 1,8,4096,128  | YES | 45.485 | - | - | - | - | torch 176.317 -> 3.88x  (d=128 is the best case)
