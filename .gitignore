@@ -1,0 +1,17 @@
+# build products
+attention
+bench_cublas
+bwd
+gemm
+multigpu
+*.o
+*.ptxas.txt
+__pycache__/
+
+# the torch venv (4.5 GB) and its build cache
+.venv/
+
+# run logs and one-off artifacts
+*.log
+*.bak
+PHASE5-DONE
