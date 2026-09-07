@@ -4,9 +4,9 @@
 measured. This document is what to do next and how not to waste days
 re-deriving things that were already settled.
 
-Repo: `~/fa-p100` (git, 4 commits). Plan of record: `~/PLAN.md` — **partly
-superseded, see "Traps in the documentation" below.** Measurements:
-`BENCH.log`, append-only.
+Repo: `~/fa-p100` (git). Plan of record: `~/PLAN.md` — **partly superseded,
+see "Traps in the documentation" below.** Measurements: `BENCH.log`,
+append-only.
 
 ---
 
@@ -35,6 +35,11 @@ full training step at d=64, 3.92× at d=128**, at ~10% less peak memory.
 
 Supported: head dim **64 or 128**, **arbitrary sequence length**, **MHA / GQA /
 MQA**, causal or dense, fp16 in/out with fp32 gradient accumulation internally.
+
+**There is now a real caller.** The kernels are registered as a HuggingFace
+attention implementation and run a stock, unmodified Qwen3-0.6B: see
+"Using it from transformers" below. That was section 5A of this document and
+it is done.
 
 `test_fa_p100.py` is 383 checks and exits non-zero on failure. **Run it before
 and after every kernel change.** It takes a few minutes.
@@ -111,7 +116,112 @@ The 175 W cap **does not bind** for compute-bound fp16 work. CUDA is **12.4**
 and must stay there (CUDA 13 dropped Pascal). Default **gcc-15 compiles CUDA
 fine** — the g++-13 note in `~/CLAUDE.md` is a llama.cpp constraint only.
 
-## 4. Traps in the documentation itself
+## 4. Using it from transformers — the real caller
+
+```python
+from transformers import AutoModelForCausalLM
+from fa_p100_hf import enable_fa_p100
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype=torch.float32).cuda()
+enable_fa_p100(model)      # registers `fa_p100` and switches the model onto it
+```
+
+Verified on stock **Qwen3-0.6B** (28 layers, 16/8 GQA, head_dim 128 — the
+kernel's best case) with **transformers 4.57.6**. The model source is
+untouched; `fa_p100_hf.py` only registers an entry in `ALL_ATTENTION_FUNCTIONS`.
+
+**transformers is pinned to 4.x on purpose.** 5.x requires torch>=2.5, and
+torch is pinned to 2.4.1 because it is the last build shipping `sm_60`. Do not
+"upgrade" either one — same trap family as CUDA 13 dropping Pascal.
+
+### Correctness: measured against the eager-vs-sdpa envelope
+
+`verify_hf.py` runs the same weights through sdpa, eager, and fa_p100. The
+question is not "is fa_p100 close to sdpa" in the abstract — it is whether
+fa_p100 sits inside the envelope *two torch backends already occupy* when they
+disagree with each other from summation order alone.
+
+| seq_len | mean | p99 | p99.99 | loss gap | top-1 vs sdpa |
+|---|---|---|---|---|---|
+| 1024 | 1.01x | 1.00x | 0.48x | −3.02e-4 nats | 99.41% (eager 99.71%) |
+| 2048 | 1.03x | 1.00x | 1.99x | −2.43e-4 nats | 99.41% (eager 99.61%) |
+
+**Do not gate on max-abs.** Over 2048x151936 = 311M logits the maximum is an
+extreme order statistic. It swung **0.48x → 3.89x** of eager between seq_len
+1024 and 2048 *on an unchanged kernel*, and at 1024 it is **eager** that has
+1202 logits over 0.2 while fa_p100 has zero. An earlier version of
+`verify_hf.py` gated on it and produced a spurious FAIL. Gate on mean, p99.99,
+loss and top-1 agreement, as it does now.
+
+**Error does not grow with sequence position** — mean deviation per 256-token
+bucket is flat (6.7e-3 → 6.4e-3), the same shape as eager's. That was the
+hypothesis worth testing, since online softmax rescales over more blocks as N
+grows. It is not happening.
+
+### Speed: 3.9x in the microbenchmark is 1.15–1.62x end to end
+
+`finetune_hf.py` runs the *same* fine-tune twice from the same initial weights
+over the same data in the same order, once per implementation.
+
+| seq_len | sdpa | fa_p100 | speedup | loss drift |
+|---|---|---|---|---|
+| 1024 | 1217.7 ms | 1061.6 ms | **1.15x** | 4.9e-4 |
+| 2048 | 2934.9 ms | 2288.9 ms | **1.28x** | 3.0e-4 |
+| 4096 (grad ckpt) | 9486.6 ms | 6665.6 ms | **1.42x** | 1.7e-4 |
+| 8192 (grad ckpt) | 29366.0 ms | 18117.8 ms | **1.62x** | 2.5e-4 |
+
+This is Amdahl, and it is the honest number. A 0.6B model with a **151936**
+vocabulary spends most of its step in the LM head and the MLPs; attention is a
+minority of the work until N gets large, which is exactly why the speedup
+climbs with sequence length. Expect more on a model with a smaller
+vocab-to-depth ratio, and less on a shallower one.
+
+**Peak memory is identical (1.00x), and that is the correct result, not a
+null one.** torch selects `mem_efficient` on sm_60, which already avoids the
+N² score matrix, and the peak here is dominated by ~9.5 GiB of AdamW state
+(fp32 weights + grads + m + v) that no attention kernel touches.
+
+### What raises, and why none of it degrades quietly
+
+Every unsupported path raises `NotImplementedError`. This is deliberate: the
+failure mode to avoid is a model that trains to a slightly wrong answer.
+
+- **padding / arbitrary masks.** Pack sequences to a fixed length instead.
+  This one needs care: `masking_utils._preprocess_mask_arguments` early-exits
+  with a **None** mask for any `_attn_implementation` absent from
+  `ALL_MASK_ATTENTION_FUNCTIONS`, which is what we want (no B×H×N×N mask is
+  ever built) — but it means a padding mask handed to `model()` would be
+  dropped **silently**. `enable_fa_p100` installs a forward guard that catches
+  it. Do not "fix" this by registering a mask function: the kernel takes no
+  mask argument, so the mask would be built and then ignored.
+- **KV-cache decoding.** The kernel requires `q_len == kv_len`. Caught in the
+  forward guard, not the attention interface, because there it would only fire
+  on the first *decode* step — i.e. after a successful prefill, halfway
+  through a `generate()` call. `enable_fa_p100` sets `use_cache=False`, and
+  cache-free generation works (quadratic, but correct).
+- sliding-window attention, attention dropout, `output_attentions`,
+  `head_mask`, head_dim ∉ {64,128}, and any scale other than `1/sqrt(D)`
+  (it is **hardcoded** in the `.cu` dispatch, so a model wanting another one
+  would be silently mis-scaled).
+
+### Two traps that cost real time here
+
+**`labels=` OOMs at seq_len 2048 on a 16 GiB card.** transformers'
+`ForCausalLMLoss` upcasts the whole logit tensor to fp32 — 2048×151936×4 =
+1.24 GiB, plus as much again inside `cross_entropy`. It looks like an
+attention memory problem and is not; it hits sdpa identically.
+`finetune_hf.py` checkpoints the LM head per chunk instead, which is what
+makes seq_len ≥ 2048 reachable and therefore what makes the kernel's
+contribution measurable at all.
+
+**q and k arrive as fp32 even under `torch.autocast`.** Qwen3's per-head
+`q_norm`/`k_norm` multiply by an fp32 master weight, which promotes them back
+after the fp16 `q_proj`; the rotary `cos`/`sin` are fp32 for the same reason.
+`v` arrives fp16. torch's SDPA never shows this because autocast intercepts
+SDPA itself and casts its inputs down — **a custom attention interface has to
+do it explicitly.** Getting it wrong is silent: it just runs slower.
+
+## 5. Traps in the documentation itself
 
 `~/PLAN.md` is the original plan, annotated with results. **Several of its
 conclusions were later overturned by better measurement**, and the phase
@@ -132,46 +242,59 @@ original plan:
    ships `sm_60`. The real blocker was Ubuntu 26.04 shipping Python 3.14 only.
 5. `Bc=16` for d=128 is **18% worse** than `Bc=32`, not better.
 
-## 5. The goal, and what to do next
+## 6. The goal, and what to do next
 
-**The original goal is met.** The plan's seven phases are complete and the
-kernel beats the best thing torch offers on this hardware by 3–4×.
+**The original goal is met, and the kernels now have a real caller.** The
+plan's seven phases are complete, the kernel beats the best thing torch offers
+on this hardware by 3–4× in isolation, and it trains a stock HuggingFace
+Qwen3-0.6B correctly at 1.15–1.62× end to end (§4).
 
-**The next objective has not been chosen — that is a decision for the user, not
-an assumption for you to make.** The three plausible directions, with honest
-assessments:
+**The next objective is a decision for the user, not an assumption for you to
+make.** Assessments, updated now that A is done:
 
-### A. Use it in something real *(recommended if the point was ever to use it)*
-Nothing currently consumes these kernels. They are a validated library with no
-caller. Wiring them into an actual training run is the only way to find the
-integration bugs a synthetic test suite cannot. Note the box's serving stack is
-**llama.cpp/llama-swap, which is C++ and does not use PyTorch** — so a PyTorch
-training job is a different workload from what this machine currently runs.
+### A. Use it in something real — *done, and what it revealed*
+`fa_p100_hf.py` + `verify_hf.py` + `finetune_hf.py`. What the integration
+found that no synthetic suite could: the silent-mask early-exit, the
+prefill-succeeds-then-decode-fails cache trap, the fp32 q/k promotion through
+`q_norm` under autocast, and the fact that the LM head — not attention — is
+what OOMs a 0.6B model on a 16 GiB card. All four are written up in §4.
 
-### B. Close the remaining feature gaps
+The remaining honest gap is that this is a **demonstration fine-tune on a
+small corpus**, not a production training job. If there is a model someone
+actually wants trained here, that is the natural next step, and the plumbing
+is now in place.
+
+### B. Close the remaining feature gaps *(now the highest-value direction)*
 No dropout, no attention bias / ALiBi, no arbitrary mask, no sliding-window or
-block-sparse, head dims restricted to 64 and 128, fp16 only (bf16 is impossible
-— Pascal has no hardware for it). Each is self-contained. Attention bias and
-arbitrary masks are the ones real models most often need.
+block-sparse, head dims restricted to 64 and 128, fp16 only (bf16 is
+impossible — Pascal has no hardware for it). Each is self-contained.
+
+§4 sharpened the priority: **arbitrary masks are the binding constraint**, not
+a nice-to-have. Without them the kernel cannot do padded batches (so batching
+means packing), cannot do sliding-window models at all, and cannot serve a KV
+cache. `attention bias` is second. Head-dim coverage is third — a good many
+models are neither 64 nor 128.
 
 ### C. Keep optimising the backward
 It runs at 6.5× its own forward against a 2.5× flop ratio. It is **issue-bound**
 (see §3), so the levers are: reduce address arithmetic in the three inner loops,
 or shrink the six-tile 48 KB shared footprint (`Qs, dOs, Ks, Vs, Ps, dSs`) so
 `BR` can grow and Q/dO get re-read less. **This is a redesign, not a tweak**,
-and it improves a number that is already winning by 3.4×. Lowest value of the
-three.
+and §4 lowered its value further: at the end-to-end level attention is a
+minority of the step, so a 10% kernel win is worth ~2–4% of a training run.
+Still lowest value of the three.
 
 ### Small and cheap, whoever picks this up
 - **`attention.cu` benchmarks the wrong baseline.** It still prints
   `0.58x unfused <-- slower` for d=128 against the hand-rolled cuBLAS path.
   Correct code, misleading framing, and the last place in the repo still
   quoting a comparison that was shown to be wrong. Point it at torch SDPA.
-- `~/.cache/pip` holds 3.0 GB that is reclaimable.
+- `~/.cache/pip` holds 3.0 GB that is reclaimable. The venv now also carries
+  transformers and a 1.5 GB Qwen3-0.6B in `~/.cache/huggingface`.
 - A pending kernel upgrade (`7.0.0-31` in `/boot`, running `-30`) — **the user
   has explicitly deferred this.** Do not reboot; it takes llama-swap down.
 
-## 6. Layout
+## 7. Layout
 
 | file | what |
 |---|---|
@@ -184,6 +307,9 @@ three.
 | `gemm.cu`, `bench_cublas.cu` | Phase 1 GEMM and cuBLAS baselines |
 | `attention.cu`, `bwd.cu` | standalone CUDA drivers (see the caveat above) |
 | `multigpu.cu` | two-GPU scaling — 1.99× of ideal, nothing to do here |
+| `fa_p100_hf.py` | **HuggingFace attention implementation + guards (§4)** |
+| `verify_hf.py` | parity vs sdpa/eager on a real model — exits non-zero on failure |
+| `finetune_hf.py` | the same fine-tune on both backends, loss curves + wall clock |
 
 **Precision tiers.** Forward: `drain16` for LayerNorm'd O(1) activations,
 `fp32mac` (+28%) when inputs are unnormalised or unknown. Never ship

@@ -267,3 +267,58 @@
 2026-09-07 | F | flash step | 1,16,4096,64  | no  | 57.756 | - | - | - | 84 MB | torch 190.203 -> 3.29x  (bwd alone 3.45x)
 2026-09-07 | F | flash step | 1,16,4096,64  | YES | 29.596 | - | - | - | 84 MB | torch  97.350 -> 3.29x  (bwd alone 3.46x)
 2026-09-07 | F | flash step | 1,8,4096,128  | YES | 45.485 | - | - | - | - | torch 176.317 -> 3.88x  (d=128 is the best case)
+#
+# ============================================================================
+# PHASE 8 -- REAL CALLER: Qwen3-0.6B fine-tune through HuggingFace transformers
+# 2026-09-07. HANDOFF.md 5A said the kernels were "a validated library with no
+# caller". This closes that. Registered as an attention implementation named
+# `fa_p100` (fa_p100_hf.py); the model is unmodified stock transformers 4.57.6.
+#
+# Qwen3-0.6B: 28 layers, 16/8 GQA, head_dim 128 -- the kernel's best case.
+# fp32 master weights + autocast fp16 + GradScaler + AdamW, batch 1, packed
+# fixed-length blocks (no padding, because the kernel takes no mask).
+#
+# --- correctness, vs BOTH torch backends on the same weights (verify_hf.py) ---
+# The yardstick is the eager-vs-sdpa envelope: two torch backends, both fp16,
+# disagreeing purely from summation order.
+2026-09-07 | 8 | parity seq1024 | 1,16,1024,128 | YES | - | - | - | PASS | - | mean 1.01x p99 1.00x p99.99 0.48x of eager envelope; loss -3.02e-4 nats; top1 99.41% vs eager 99.71%
+2026-09-07 | 8 | parity seq2048 | 1,16,2048,128 | YES | - | - | - | PASS | - | mean 1.03x p99 1.00x p99.99 1.99x; loss -2.43e-4 nats; top1 99.41% vs eager 99.61%
+#
+# Deviation does NOT grow with sequence position -- mean per 256-token bucket
+# is flat (6.7e-3 -> 6.4e-3), same shape as eager's. So there is no online-
+# softmax accumulation drift, which was the hypothesis worth testing.
+#
+# DO NOT GATE ON MAX-ABS. Over 2048x151936 = 311M logits the max is an extreme
+# order statistic. It swung 0.48x -> 3.89x of eager between seq_len 1024 and
+# 2048 on an UNCHANGED kernel, and at 1024 it is eager that has 1202 logits
+# over 0.2 while fa_p100 has zero. Gate on mean, p99.99, loss, and top-1.
+#
+# --- speed: full fine-tune step, median of 10, same init + same data order ---
+# "gc" = gradient checkpointing (attention runs twice per step, so its share
+# of the wall clock rises; also the only way seq >= 4096 fits in 16 GiB).
+2026-09-07 | 8 | ft step seq1024      | 1,16,1024,128 | YES |  1061.6 | - | - | loss drift 4.9e-4 | 11.12 GiB | sdpa  1217.7 -> 1.15x
+2026-09-07 | 8 | ft step seq2048      | 1,16,2048,128 | YES |  2288.9 | - | - | loss drift 3.0e-4 | 13.15 GiB | sdpa  2934.9 -> 1.28x
+2026-09-07 | 8 | ft step seq4096 gc   | 1,16,4096,128 | YES |  6665.6 | - | - | loss drift 1.7e-4 | 11.12 GiB | sdpa  9486.6 -> 1.42x
+2026-09-07 | 8 | ft step seq8192 gc   | 1,16,8192,128 | YES | 18117.8 | - | - | loss drift 2.5e-4 | 11.13 GiB | sdpa 29366.0 -> 1.62x
+#
+# The 3.9x microbenchmark becomes 1.15-1.62x end to end, and that is the
+# honest number for this model: Amdahl. A 0.6B model with a 151936 vocab
+# spends most of its step in the LM head and the MLPs. The speedup rises with
+# sequence length exactly as attention's O(N^2) share does. It would be larger
+# on a model with a smaller vocab-to-depth ratio.
+#
+# PEAK MEMORY IS IDENTICAL (1.00x), and that is expected, not a null result:
+# torch picks mem_efficient on sm_60, which already avoids the N^2 score
+# matrix, and the peak here is dominated by AdamW state (~9.5 GiB of fp32
+# weights + grads + m + v) which no attention kernel touches.
+#
+# TRAP: `labels=` OOMs at seq_len 2048. transformers' ForCausalLMLoss upcasts
+# the full logits to fp32 -- 2048 x 151936 x 4 = 1.24 GiB, plus the same again
+# inside cross_entropy. finetune_hf.py checkpoints the head per chunk instead.
+# This is a vocab problem, not an attention problem, and it hits sdpa equally.
+#
+# TRAP: q and k reach the kernel as fp32 even under autocast, because Qwen3's
+# per-head q_norm/k_norm multiply by an fp32 master weight (and the rotary
+# cos/sin are fp32 for the same reason). v arrives fp16. torch's SDPA hides
+# this because autocast intercepts it; a custom attention interface must cast
+# down itself. Getting this wrong is silent -- it just runs slower.

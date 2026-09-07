@@ -40,6 +40,10 @@ Baseline is torch's `mem_efficient` backend, which is what SDPA actually selects
 on sm_60 (`flash` reports "No available kernel"). This is a competent baseline,
 not a strawman.
 
+**End to end, driving a stock HuggingFace Qwen3-0.6B, this becomes
+1.15–1.62×** — rising with sequence length. Both numbers are real; the gap
+between them is Amdahl, and the integration section below has the arithmetic.
+
 ---
 
 ## Phase results
@@ -277,12 +281,55 @@ the launcher picks the aligned instantiation when `N % BR == 0 && N % BC == 0`.
 Written as a runtime check it cost **7% on the backward**; this way it costs
 nothing on aligned shapes.
 
+## Driving a real model: HuggingFace Qwen3-0.6B
+
+The kernels are registered as a transformers attention implementation
+(`fa_p100_hf.py`); the model source is untouched. Verified on stock
+**Qwen3-0.6B** — 28 layers, 16/8 GQA, head_dim 128 — under transformers
+4.57.6, fp32 master weights with autocast fp16, AdamW, packed fixed-length
+blocks.
+
+**Correctness** (`verify_hf.py`), measured against the envelope torch's own
+`eager` and `sdpa` backends occupy when they disagree with each other:
+
+| seq_len | mean dev | p99 | p99.99 | loss gap | top-1 vs sdpa |
+|---|---|---|---|---|---|
+| 1024 | 1.01× | 1.00× | 0.48× | −3.02e-4 nats | 99.41% (eager 99.71%) |
+| 2048 | 1.03× | 1.00× | 1.99× | −2.43e-4 nats | 99.41% (eager 99.61%) |
+
+Deviation is flat across sequence position (6.7e-3 → 6.4e-3 per 256-token
+bucket, same shape as eager's), so the online softmax is not accumulating
+drift as N grows. **Max-abs is reported but not gated** — over 311M logits it
+is an extreme order statistic that swung 0.48× → 3.89× of eager between these
+two sequence lengths on an unchanged kernel.
+
+**Speed** (`finetune_hf.py`), same initial weights and same data order on both
+backends:
+
+| seq_len | sdpa | fa_p100 | speedup | loss drift |
+|---|---|---|---|---|
+| 1024 | 1217.7 ms | 1061.6 ms | **1.15×** | 4.9e-4 |
+| 2048 | 2934.9 ms | 2288.9 ms | **1.28×** | 3.0e-4 |
+| 4096 grad-ckpt | 9486.6 ms | 6665.6 ms | **1.42×** | 1.7e-4 |
+| 8192 grad-ckpt | 29366.0 ms | 18117.8 ms | **1.62×** | 2.5e-4 |
+
+Why 3.9× becomes 1.6×: a 0.6B model with a **151936-entry vocabulary** spends
+most of its step in the LM head and the MLPs. Attention's share grows as
+O(N²)/O(N), which is exactly the shape of the speedup column. Peak memory is
+**identical** on both backends — `mem_efficient` already avoids the N² score
+matrix, and the peak is dominated by ~9.5 GiB of AdamW state that no attention
+kernel touches. The "10% less peak memory" in the headline is a kernel-level
+result and does not survive to the model level.
+
 ## Remaining limits
 
 - **Backward is global-memory-traffic bound** and runs at 6.9× its own forward.
   It still beats torch's by 3.2×, but the headroom is real — see above.
 - **No dropout, no attention bias/ALiBi, no arbitrary mask** — causal or dense
-  only.
+  only. The HF integration showed arbitrary masks to be the *binding*
+  limitation rather than a nice-to-have: without them there is no padded
+  batching (batches must be packed), no sliding-window model, and no KV-cache
+  decoding, since the kernel requires `q_len == kv_len`.
 - **No sliding-window or block-sparse patterns.**
 - **fp16 only** — bf16 has no hardware support on Pascal at all.
 - Head dims other than 64 and 128 are not instantiated.
@@ -302,6 +349,9 @@ nothing on aligned shapes.
 | `test_fa_p100.py` | regression suite — 383 checks across both head dims, MHA/GQA/MQA, ragged N, four input regimes |
 | `bench_train.py` | full training step vs torch SDPA |
 | `multigpu.cu` | 6 — two-GPU data-parallel scaling |
+| `fa_p100_hf.py` | 8 — HuggingFace attention implementation, with guards on every unsupported path |
+| `verify_hf.py` | 8 — parity vs sdpa/eager on a real model, exits non-zero on failure |
+| `finetune_hf.py` | 8 — the same fine-tune on both backends: loss curves and wall clock |
 
 ## Running it
 
@@ -315,6 +365,23 @@ numactl --cpunodebind=0 --membind=0 ./attention      # pin to card 0's NUMA node
 
 # from Python — .venv/bin MUST be on PATH or cpp_extension cannot find ninja
 env PATH="$PWD/.venv/bin:$PATH" .venv/bin/python bench_train.py
+
+# on a real HuggingFace model (needs Qwen/Qwen3-0.6B in the HF cache)
+env PATH="$PWD/.venv/bin:$PATH" .venv/bin/python verify_hf.py   --corpus CORPUS.txt
+env PATH="$PWD/.venv/bin:$PATH" .venv/bin/python finetune_hf.py --corpus CORPUS.txt \
+    --seq-len 4096 --grad-checkpointing
+```
+
+`transformers` is pinned to **4.x** and torch to **2.4.1**: transformers 5.x
+requires torch>=2.5, and 2.4.1 is the last torch shipping `sm_60`. Neither can
+be upgraded — same trap family as CUDA 13 dropping Pascal.
+
+```python
+from transformers import AutoModelForCausalLM
+from fa_p100_hf import enable_fa_p100
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B").cuda()
+enable_fa_p100(model)      # every unsupported path raises, none degrade quietly
 ```
 
 ```python
