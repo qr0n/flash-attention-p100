@@ -64,7 +64,8 @@ between them is Amdahl, and the integration section below has the arithmetic.
 |---|---|---|
 | fp16 packed half2 | 19.04 TFLOPS | **15.79** (83%) |
 | fp32 FMA | 9.52 TFLOPS | **8.68** (91%) |
-| HBM2 bandwidth | 732 GB/s | **498.8** (68%) |
+| HBM2, read+write (hardest pattern) | 732 GB/s | **498.8** (68%) |
+| HBM2, pure read (the real ceiling) | 732 GB/s | **607** (83%) |
 | clock under load | 1328 MHz | **1328, no throttle**, 140 W of a 175 W cap |
 
 CUDA **12.4** (not 12.6 — do not "upgrade", CUDA 13 dropped Pascal).
@@ -80,8 +81,33 @@ This is the part worth re-reading. Seven corrections, all measured.
 ### 1. The break-even math was miscalculated — in the pessimistic direction
 
 The plan compared **spec** bandwidth (732 GB/s) against **achieved** compute.
-Apples to oranges. With measured bandwidth (498.8 GB/s), break-even
-`C = d·B/2` is **16.0 TFLOPS at d=64**, not 23.4.
+Apples to oranges. With measured bandwidth, break-even `C = d·B/2` is well under
+the 23.4 TFLOPS the plan assumed.
+
+**Which measured bandwidth, though — corrected 2026-09-12.** This document
+originally used 498.8 GB/s for `B`. That figure is `p100_sweep`'s `mem` result,
+which exercises **read-modify-write on one buffer** — the hardest pattern and the
+lowest of the three. The same card measures **607 GB/s on a pure read** and
+527.8 GB/s on a pure write, and 607 is the real ceiling (83% of spec; see
+`p100-llama-cpp/bench/README.md`, which reports all three).
+
+FlashAttention forward streams Q/K/V in and writes only O and the logsumexp, so
+it is **read-dominated and 607 is the right number for it**. The backward reads
+Q/K/V/O/dO and writes dQ/dK/dV with dQ accumulation, which is genuinely mixed, so
+something between the two is defensible there.
+
+| `B` | d=64 threshold | d=128 threshold |
+|---|---:|---:|
+| 498.8 GB/s (read+write) | 16.0 TFLOPS | 31.9 TFLOPS |
+| **607 GB/s (pure read)** | **19.4 TFLOPS** | **38.8 TFLOPS** |
+
+This matters because measured compute is **15.79 TFLOPS**. Against 16.0 the
+kernel looks like it sits *exactly at* break-even, memory and compute balanced.
+Against 19.4 it is **19% short of the memory threshold** — clearly compute-bound.
+The second reading is the correct one, and it agrees with this repo's own SASS
+analysis, which finds the backward **issue-bound at 3.5 instructions per useful
+FMA, not bandwidth-bound**. Using 498.8 put the headline table in tension with
+the kernel analysis; using 607 removes it.
 
 The backward then confirmed the corrected formula exactly: predicted a 5.1×
 recompute penalty, measured 5.1× (10.9 ms to recompute S vs 2.15 ms to store

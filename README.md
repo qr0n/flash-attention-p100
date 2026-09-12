@@ -146,7 +146,8 @@ on which matmul it lands in — because `dS = P(dP − D)` is a cancellation and
 |---|---|---|
 | fp16 packed `half2` | 19.04 TFLOPS | **15.79** |
 | fp32 FMA | 9.52 TFLOPS | **8.68** |
-| HBM2 bandwidth | 732 GB/s | **498.8** |
+| HBM2, read+write (hardest pattern) | 732 GB/s | **498.8** |
+| HBM2, pure read (the real ceiling) | 732 GB/s | **607** |
 
 The kernels reach ~83% of spec fp16, so there is not much left on the table at
 the instruction level. The backward is **issue-bound** — 3.5 instructions per

@@ -109,7 +109,8 @@ naive baseline**, not against torch.
 |---|---|---|
 | fp16 packed half2 | 19.04 TFLOPS | **15.79** |
 | fp32 FMA | 9.52 TFLOPS | **8.68** |
-| HBM2 | 732 GB/s | **498.8** |
+| HBM2, read+write (hardest pattern) | 732 GB/s | **498.8** |
+| HBM2, pure read (the real ceiling) | 732 GB/s | **607** |
 | clock under load | — | **1328 MHz, no throttle, 140 W of a 175 W cap** |
 
 The 175 W cap **does not bind** for compute-bound fp16 work. CUDA is **12.4**
@@ -230,7 +231,13 @@ sections still contain the superseded reasoning alongside corrections.
 original plan:
 
 1. Break-even math compared **spec** bandwidth (732) against **achieved**
-   compute. With measured bandwidth the d=64 threshold is 16.0 TFLOPS, not 23.4.
+   compute. With measured bandwidth the d=64 threshold is far under the 23.4
+   TFLOPS assumed. **Use 607 GB/s, not 498.8** (corrected 2026-09-12): 498.8 is
+   the read-modify-write pattern, 607 is the pure-read ceiling, and the forward
+   is read-dominated. That makes the d=64 threshold **19.4 TFLOPS**, not 16.0 —
+   so against 15.79 measured the kernel is **19% short of memory-bound**, which
+   agrees with the SASS finding above rather than contradicting it. See
+   `REPORT.md` §1.
 2. The d=128 precision bug is **not** the accumulation length it tells you to
    suspect — it was pre-scaling Q by `1/√d` in fp16 (`1/√128` is not a power of
    two, so it rounds every Q entry *before* any MAC). Apply the scale to the
